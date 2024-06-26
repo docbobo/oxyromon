@@ -565,6 +565,7 @@ async fn delete_old_games(
         );
         delete_game_by_name_and_system_id(connection, &game.name, system_id).await;
     }
+    orphan_romfile_ids.dedup();
     orphan_romfile_ids
 }
 
