@@ -913,6 +913,7 @@ async fn to_archive(
 
         let romfile = romfiles.first().unwrap();
 
+        let mut handled = false;
         for rom in roms {
             let game = games_by_id.get(&rom.game_id).unwrap();
 
@@ -962,9 +963,14 @@ async fn to_archive(
                 archive_romfile.as_common()?.get_size().await?,
             )
             .await;
-    }
+
+            handled = true;        
+        }
     
-        remove_file(progress_bar, &romfile.path, false).await?;
+        if handled {
+            romfile.as_common()?.delete(progress_bar, false).await?;
+        }
+        
         commit_transaction(transaction).await;
     }
 
