@@ -901,12 +901,23 @@ async fn to_archive(
         let tmp_directory = create_tmp_directory(connection).await?;
         let mut transaction = begin_transaction(connection).await;
 
+        let mut romfiles: Vec<&Romfile> = roms
+            .par_iter()
+            .map(|rom| romfiles_by_id.get(&rom.romfile_id.unwrap()).unwrap())
+            .collect();
+        romfiles.dedup();
+
+        if romfiles.len() > 1 {
+            bail!("Multiple archives found");
+        }
+
+        let romfile = romfiles.first().unwrap();
+
         for rom in roms {
             let game = games_by_id.get(&rom.game_id).unwrap();
-            let romfile = romfiles_by_id.get(&rom.romfile_id.unwrap()).unwrap();
 
             let mut archive_romfile = romfile.as_archive(rom)?;
-
+            
             // skip archives that are the same type
             if archive_romfile.archive_type == archive_type {
                 continue;
@@ -951,10 +962,9 @@ async fn to_archive(
                 archive_romfile.as_common()?.get_size().await?,
             )
             .await;
-
-            romfile.as_common()?.delete(progress_bar, false).await?;
-        }
-
+    }
+    
+        remove_file(progress_bar, &romfile.path, false).await?;
         commit_transaction(transaction).await;
     }
 
