@@ -14,6 +14,8 @@ use super::prompt::*;
 use super::sevenzip;
 use super::sevenzip::{ArchiveFile, ArchiveRomfile, AsArchive, ToArchive};
 use super::util::*;
+use super::wit;
+use super::wit::{AsWbfs, ToWbfs};
 use super::SimpleResult;
 use clap::builder::PossibleValuesParser;
 use clap::{Arg, ArgAction, ArgMatches, Command};
@@ -27,7 +29,7 @@ use std::mem::drop;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-const ALL_FORMATS: &[&str] = &["ORIGINAL", "7Z", "CHD", "CSO", "NSZ", "RVZ", "ZIP", "ZSO"];
+const ALL_FORMATS: &[&str] = &["ORIGINAL", "7Z", "CHD", "CSO", "NSZ", "RVZ", "ZIP", "WBFS", "ZSO"];
 const ARCADE_FORMATS: &[&str] = &["ORIGINAL", "ZIP"];
 
 pub fn subcommand() -> Command {
@@ -166,6 +168,12 @@ pub async fn main(
         "RVZ" => {
             if dolphin::get_version().await.is_err() {
                 progress_bar.println("Please install dolphin");
+                return Ok(());
+            }
+        }
+        "WBFS" => {
+            if wit::get_version().await.is_err() {
+                progress_bar.println("Please install wit");
                 return Ok(());
             }
         }
@@ -381,6 +389,19 @@ pub async fn main(
                     &compression_algorithm,
                     compression_level,
                     block_size,
+                )
+                .await?
+            }
+            "WBFS" => {
+                to_wbfs(
+                    connection,
+                    progress_bar,                    
+                    roms_by_game_id,
+                    romfiles_by_id,
+                    recompress,
+                    diff,
+                    check,
+                    &hash_algorithm,
                 )
                 .await?
             }
@@ -2862,6 +2883,231 @@ async fn to_rvz(
                     }
                     romfile.as_common()?.delete(progress_bar, false).await?;
                     rvz_romfile
+                        .as_common()?
+                        .rename(progress_bar, &romfile.path, false)
+                        .await?;
+                };
+
+                update_romfile(
+                    &mut transaction,
+                    romfile.id,
+                    &romfile.as_common()?.to_string(),
+                    romfile.as_common()?.get_size().await?,
+                )
+                .await;
+            }
+
+            commit_transaction(transaction).await;
+        }
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn to_wbfs(
+    connection: &mut SqliteConnection,
+    progress_bar: &ProgressBar,
+    roms_by_game_id: IndexMap<i64, Vec<Rom>>,
+    romfiles_by_id: HashMap<i64, Romfile>,
+    recompress: bool,
+    diff: bool,
+    check: bool,
+    hash_algorithm: &HashAlgorithm,
+) -> SimpleResult<()> {
+    // partition archives
+    let (archives, others): (IndexMap<i64, Vec<Rom>>, IndexMap<i64, Vec<Rom>>) =
+        roms_by_game_id.into_iter().partition(|(_, roms)| {
+            roms.par_iter().any(|rom| {
+                let romfile = romfiles_by_id.get(&rom.romfile_id.unwrap()).unwrap();
+                romfile.path.ends_with(ZIP_EXTENSION) || romfile.path.ends_with(SEVENZIP_EXTENSION)
+            })
+        });
+
+    // partition ISOs
+    let (isos, others): (IndexMap<i64, Vec<Rom>>, IndexMap<i64, Vec<Rom>>) =
+        others.into_iter().partition(|(_, roms)| {
+            roms.par_iter().any(|rom| {
+                romfiles_by_id
+                    .get(&rom.romfile_id.unwrap())
+                    .unwrap()
+                    .path
+                    .ends_with(ISO_EXTENSION)
+            })
+        });
+
+    // partition WBFSs
+    let (wbfss, others): (IndexMap<i64, Vec<Rom>>, IndexMap<i64, Vec<Rom>>) =
+        others.into_iter().partition(|(_, roms)| {
+            roms.par_iter().any(|rom| {
+                romfiles_by_id
+                    .get(&rom.romfile_id.unwrap())
+                    .unwrap()
+                    .path
+                    .ends_with(WBFS_EXTENSION)
+            })
+        });
+
+    // drop others
+    drop(others);
+
+    // convert archives
+    for roms in archives.values() {
+        let tmp_directory = create_tmp_directory(connection).await?;
+        let mut transaction = begin_transaction(connection).await;
+
+        let mut romfiles: Vec<&Romfile> = roms
+            .iter()
+            .map(|rom| romfiles_by_id.get(&rom.romfile_id.unwrap()).unwrap())
+            .collect();
+        romfiles.dedup();
+
+        if romfiles.len() > 1 {
+            bail!("Multiple archives found");
+        }
+
+        if roms.len() > 1 || !roms.first().unwrap().name.ends_with(ISO_EXTENSION) {
+            continue;
+        }
+
+        let rom = roms.first().unwrap();
+        let romfile = romfiles.first().unwrap();
+
+
+        let wbfs_romfile = romfile
+            .as_archive(rom)?
+            .to_common(progress_bar, &tmp_directory.path())
+            .await?
+            .as_iso()?
+            .to_wbfs(
+                progress_bar,
+                &romfile.as_common()?.path.parent().unwrap()        
+            )
+            .await?;
+
+        if check
+            && wbfs_romfile
+                .check(
+                    &mut transaction,
+                    progress_bar,
+                    &None,
+                    &[rom],
+                    hash_algorithm,
+                )
+                .await
+                .is_err()
+        {
+            progress_bar.println("Converted file doesn't match the original");
+            wbfs_romfile.as_common()?.delete(progress_bar, false).await?;
+            continue;
+        };
+
+        if diff {
+            print_diff(progress_bar, &[rom], &[&romfile.path], &[&wbfs_romfile.path]).await?;
+        }
+
+        update_romfile(
+            &mut transaction,
+            romfile.id,
+            &wbfs_romfile.as_common()?.to_string(),
+            wbfs_romfile.as_common()?.get_size().await?,
+        )
+        .await;
+        romfile.as_common()?.delete(progress_bar, false).await?;
+
+        commit_transaction(transaction).await;
+    }
+
+    // convert ISOs
+    for roms in isos.values() {
+        let mut transaction = begin_transaction(connection).await;
+
+        for rom in roms {
+            let romfile = romfiles_by_id.get(&rom.romfile_id.unwrap()).unwrap();
+            let wbfs_romfile = romfile
+                .as_iso()?
+                .to_wbfs(
+                    progress_bar,
+                    &romfile.as_common()?.path.parent().unwrap(),                    
+                )
+                .await?;
+            if check
+                && wbfs_romfile
+                    .check(
+                        &mut transaction,
+                        progress_bar,
+                        &None,
+                        &[rom],
+                        hash_algorithm,
+                    )
+                    .await
+                    .is_err()
+            {
+                progress_bar.println("Converted file doesn't match the original");
+                wbfs_romfile.as_common()?.delete(progress_bar, false).await?;
+                continue;
+            };
+            if diff {
+                print_diff(progress_bar, &[rom], &[&romfile.path], &[&wbfs_romfile.path]).await?;
+            }
+            update_romfile(
+                &mut transaction,
+                romfile.id,
+                &wbfs_romfile.as_common()?.to_string(),
+                wbfs_romfile.as_common()?.get_size().await?,
+            )
+            .await;
+            romfile.as_common()?.delete(progress_bar, false).await?;
+        }
+
+        commit_transaction(transaction).await;
+    }
+
+    // convert RVZs
+    if recompress {
+        for roms in wbfss.values() {
+            let tmp_directory = create_tmp_directory(connection).await?;
+            let mut transaction = begin_transaction(connection).await;
+
+            for rom in roms {
+                let romfile = romfiles_by_id.get(&rom.romfile_id.unwrap()).unwrap();
+                let wbfs_romfile = romfile
+                    .as_wbfs()?
+                    .to_iso(progress_bar, &romfile.as_common()?.path.parent().unwrap())
+                    .await?
+                    .to_wbfs(
+                        progress_bar,
+                        &tmp_directory.path(),
+                    )
+                    .await?;
+
+                if check
+                    && wbfs_romfile
+                        .check(
+                            &mut transaction,
+                            progress_bar,
+                            &None,
+                            &[rom],
+                            hash_algorithm,
+                        )
+                        .await
+                        .is_err()
+                {
+                    progress_bar.println("Converted file doesn't match the original");
+                    wbfs_romfile.as_common()?.delete(progress_bar, false).await?;
+                    continue;
+                } else {
+                    if diff {
+                        print_diff(
+                            progress_bar,
+                            &roms.iter().collect::<Vec<&Rom>>(),
+                            &[&romfile.path],
+                            &[&wbfs_romfile.path],
+                        )
+                        .await?;
+                    }
+                    romfile.as_common()?.delete(progress_bar, false).await?;
+                    wbfs_romfile
                         .as_common()?
                         .rename(progress_bar, &romfile.path, false)
                         .await?;
