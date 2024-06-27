@@ -13,6 +13,8 @@ use super::nsz::AsNsz;
 use super::prompt::*;
 use super::sevenzip;
 use super::util::*;
+use super::wit;
+use super::wit::AsWbfs;
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use indicatif::ProgressBar;
 use simple_error::SimpleResult;
@@ -262,6 +264,21 @@ async fn check_system(
             }
             result = romfile
                 .as_rvz()?
+                .check(
+                    &mut transaction,
+                    progress_bar,
+                    &header,
+                    &romfile_roms,
+                    hash_algorithm,
+                )
+                .await;
+        } else if WBFS_EXTENSION == romfile_extension {
+            if wit::get_version().await.is_err() {
+                progress_bar.println("Please install wit");
+                break;
+            }
+            result = romfile
+                .as_wbfs()?
                 .check(
                     &mut transaction,
                     progress_bar,

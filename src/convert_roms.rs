@@ -3576,6 +3576,18 @@ async fn to_original(
             })
         });
 
+        // partition WBFSs
+        let (wbfss, others): (IndexMap<i64, Vec<Rom>>, IndexMap<i64, Vec<Rom>>) =
+        others.into_iter().partition(|(_, roms)| {
+            roms.par_iter().any(|rom| {
+                romfiles_by_id
+                    .get(&rom.romfile_id.unwrap())
+                    .unwrap()
+                    .path
+                    .ends_with(WBFS_EXTENSION)
+            })
+        });
+
     // partition ZSOs
     let (zsos, others): (IndexMap<i64, Vec<Rom>>, IndexMap<i64, Vec<Rom>>) =
         others.into_iter().partition(|(_, roms)| {
@@ -3956,6 +3968,53 @@ async fn to_original(
             let romfile = romfiles_by_id.get(&rom.romfile_id.unwrap()).unwrap();
             let iso_romfile = romfile
                 .as_rvz()?
+                .to_iso(progress_bar, &romfile.as_common()?.path.parent().unwrap())
+                .await?;
+
+            if check
+                && iso_romfile
+                    .as_common()?
+                    .check(
+                        &mut transaction,
+                        progress_bar,
+                        &None,
+                        &[rom],
+                        hash_algorithm,
+                    )
+                    .await
+                    .is_err()
+            {
+                progress_bar.println("Converted file doesn't match the original");
+                iso_romfile.as_common()?.delete(progress_bar, false).await?;
+                continue;
+            };
+
+            update_romfile(
+                &mut transaction,
+                romfile.id,
+                &iso_romfile.as_common()?.to_string(),
+                iso_romfile.as_common()?.get_size().await?,
+            )
+            .await;
+            romfile.as_common()?.delete(progress_bar, false).await?;
+        }
+
+        commit_transaction(transaction).await;
+    }
+
+    // convert WBFSs
+    for roms in wbfss.values() {
+        if wit::get_version().await.is_err() {
+            progress_bar.println("Please install wit");
+            break;
+        }
+
+        let mut transaction = begin_transaction(connection).await;
+
+        for rom in roms {
+            let romfile = romfiles_by_id.get(&rom.romfile_id.unwrap()).unwrap();
+            let iso_romfile = romfile
+                .as_wbfs()?
                 .to_iso(progress_bar, &romfile.as_common()?.path.parent().unwrap())
                 .await?;
 
